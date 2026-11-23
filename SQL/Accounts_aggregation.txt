@@ -1,4 +1,4 @@
-Note!!! : Le schéma utilisé dans ce projet se nomme 'ourschema'.
+Note !!! : Le schéma utilisé dans ce projet se nomme 'ourschema'.
    Si vos données brutes sont stockées dans un autre schéma (ex: 'raw' ou 'public'),
    veuillez remplacer 'ourschema' par le nom de votre schéma avant d'exécuter le script.
 --  Création des schémas (dossiers logiques pour séparer les données brutes des résultats)
