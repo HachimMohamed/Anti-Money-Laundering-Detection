@@ -1,0 +1,7 @@
+pandas
+Numpy
+scikit-learn
+hdbscan
+sqlalchemy
+psycopg2-binary
+jupyter

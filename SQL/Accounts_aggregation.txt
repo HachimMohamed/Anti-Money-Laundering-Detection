@@ -1,0 +1,161 @@
+--  Création des schémas (dossiers logiques pour séparer les données brutes des résultats)
+
+================================================ Partie 1 : PostgreSQL  ==================================================================
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Phase 1 : DDL (Schémas, Tables et Clés PK / FK)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+-- 1. Création des schémas (dossiers logiques pour séparer les données brutes des résultats)
+
+CREATE SCHEMA IF NOT EXISTS raw;
+CREATE SCHEMA IF NOT EXISTS analytics;
+
+--  Table des comptes avec Clé Primaire Composée (account_number, bank_id)
+
+CREATE TABLE raw.comptes (
+    bank_name VARCHAR(100),
+    bank_id VARCHAR(50),
+    account_number VARCHAR(50),
+    entity_id VARCHAR(50),
+    entity_name VARCHAR(150),
+    PRIMARY KEY (account_number, bank_id) -- Garantit qu'un compte est unique AU SEIN d'une même banque
+);
+
+--  Table des transactions
+
+CREATE TABLE raw.transactions (
+    transaction_id SERIAL PRIMARY KEY, -- SERIAL génère un identifiant auto-incrémenté (1, 2, 3...)
+    tx_timestamp TIMESTAMP,
+    from_bank VARCHAR(50),
+    from_account VARCHAR(50),
+    to_bank VARCHAR(50),
+    to_account VARCHAR(50),
+    amount_received NUMERIC(15, 2),
+    receiving_currency VARCHAR(20),
+    amount_paid NUMERIC(15, 2),
+    payment_currency VARCHAR(20),
+    payment_format VARCHAR(50),
+    is_laundering INT
+);
+
+--  Modification de structure (ALTER) : ajout d'une colonne de classification métier
+ALTER TABLE raw.transactions ADD COLUMN niveau_risque VARCHAR(20);
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Phase 2 : Importation et DML (Nettoyage et mise à jour des lignes)
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-- Chargement des comptes
+\copy raw.comptes FROM 'C:/aml_project/HI-Small_accounts.csv' DELIMITER ',' CSV HEADER;
+
+-- Chargement des transactions (on liste les colonnes du CSV car transaction_id est généré par SERIAL)
+\copy raw.transactions(tx_timestamp, from_bank, from_account, to_bank, to_account, amount_received, receiving_currency, amount_paid, payment_currency, payment_format, is_laundering) FROM 'C:/aml_project/HI-Small_Trans.csv' DELIMITER ',' CSV HEADER;
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+-- 1. Suppression des lignes aberrantes (virements nuls ou négatifs)
+DELETE FROM raw.transactions WHERE amount_paid <= 0;
+
+-- 2. Mise à jour conditionnelle (CASE WHEN) pour catégoriser le risque de montant
+UPDATE raw.transactions
+SET niveau_risque = CASE 
+    WHEN amount_paid >= 50000 THEN 'Eleve'
+    WHEN amount_paid BETWEEN 10000 AND 49999.99 THEN 'Moyen'
+    ELSE 'Faible'
+END;
+
+INSERT INTO ourschema.comptes (account_number, bank_id, bank_name, entity_name)
+SELECT DISTINCT from_account, from_bank, 'Banque Inconnue', 'Entite Externe'
+FROM ourschema.transactions
+UNION
+SELECT DISTINCT to_account, to_bank, 'Banque Inconnue', 'Entite Externe'
+FROM ourschema.transactions
+ON CONFLICT (account_number, bank_id) DO NOTHING;
+
+ALTER TABLE ourschema.transactions 
+ADD CONSTRAINT fk_from_account 
+FOREIGN KEY (from_account, from_bank) REFERENCES ourschema.comptes(account_number, bank_id);
+
+ALTER TABLE ourschema.transactions 
+ADD CONSTRAINT fk_to_account 
+FOREIGN KEY (to_account, to_bank) REFERENCES ourschema.comptes(account_number, bank_id);
+
+-- 4. Indexation des clés de jointure pour accélérer les requêtes suivantes
+CREATE INDEX idx_tx_from ON raw.transactions(from_account, from_bank);
+CREATE INDEX idx_tx_to ON raw.transactions(to_account, to_bank);
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Requête 1 : Opération ensembliste (UNION) — Lister tous les couples (compte, banque) actifs
+
+SELECT from_account AS account_number, from_bank AS bank_id FROM raw.transactions
+UNION
+SELECT to_account AS account_number, to_bank AS bank_id FROM raw.transactions;
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Phase 2 & Phase 4 : DQL, Jointures, Self-Join, Ensembles & Agrégations
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Requête 2 : Jointures multiples (INNER JOIN / LEFT JOIN) — Enrichir les virements
+
+SELECT 
+    t.transaction_id,
+    t.tx_timestamp,
+    c1.entity_name AS entite_emettrice,
+    c2.entity_name AS entite_receptrice,
+    t.amount_paid,
+    t.payment_currency,
+    t.niveau_risque
+FROM raw.transactions t
+INNER JOIN raw.comptes c1 
+    ON t.from_account = c1.account_number AND t.from_bank = c1.bank_id
+LEFT JOIN raw.comptes c2 
+    ON t.to_account = c2.account_number AND t.to_bank = c2.bank_id
+WHERE t.payment_currency IN ('US Dollar', 'Euro')
+ORDER BY t.amount_paid DESC
+LIMIT 100;
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Requête 3 : Auto-jointure (Self-Join) — Détecter le rebond rapide d'argent (A -> B -> C)
+
+SELECT 
+    t1.from_account AS compte_A,
+    t1.to_account AS compte_rebond_B,
+    t2.to_account AS compte_C,
+    t1.amount_paid AS montant_entree_B,
+    t2.amount_paid AS montant_sortie_B,
+    t1.tx_timestamp AS heure_1,
+    t2.tx_timestamp AS heure_2
+FROM raw.transactions t1
+INNER JOIN raw.transactions t2 
+    ON t1.to_account = t2.from_account 
+    AND t1.to_bank = t2.from_bank -- Le récepteur du 1er virement devient l'émetteur du 2ème
+WHERE t2.tx_timestamp BETWEEN t1.tx_timestamp AND (t1.tx_timestamp + INTERVAL '2 hours')
+  AND NOT (t1.from_account = t2.to_account AND t1.from_bank = t2.to_bank)
+LIMIT 500;
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+Requête 4 : Agrégation (GROUP BY + HAVING) — Création de la vue finale pour Python
+
+CREATE VIEW analytics.dataset_ml_aml AS
+SELECT 
+    t.from_account AS account_number,
+    t.from_bank AS bank_id,
+    c.bank_name,
+    c.entity_name,
+    COUNT(t.transaction_id) AS nb_virements_emis,
+    COUNT(DISTINCT (t.to_account, t.to_bank)) AS nb_beneficiaires_uniques,
+    COUNT(DISTINCT t.to_bank) AS nb_banques_destinatrices,
+    SUM(t.amount_paid) AS volume_total_envoye,
+    ROUND(AVG(t.amount_paid), 2) AS montant_moyen,
+    MAX(t.amount_paid) AS montant_max,
+    SUM(CASE WHEN t.payment_format = 'Wire' THEN 1 ELSE 0 END) AS nb_virements_wire,
+    SUM(CASE WHEN t.niveau_risque = 'Eleve' THEN 1 ELSE 0 END) AS nb_ops_risque_eleve,
+    MAX(t.is_laundering) AS label_blanchiment_reel -- Conservé uniquement pour évaluer le modèle à la fin
+FROM raw.transactions t
+INNER JOIN raw.comptes c 
+    ON t.from_account = c.account_number AND t.from_bank = c.bank_id
+WHERE t.payment_currency = 'US Dollar' -- Alternative simple : isole le dollar pour éviter la conversion de devises
+GROUP BY t.from_account, t.from_bank, c.bank_name, c.entity_name
+HAVING COUNT(t.transaction_id) >= 3; -- Filtre après agrégation : garde uniquement les comptes actifs (3+ virements)
+
+++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+
+====================================== Partie 2 : Machine Learning Non Supervisé (Python) ==========================================
+A voir le fichier 'ML_non_supervisé.ipynb'
